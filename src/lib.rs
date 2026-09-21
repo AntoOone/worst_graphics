@@ -1,11 +1,13 @@
 use anyhow::{Error, Result};
 
-use ash::{khr, vk};
+use ash::{khr, prelude::VkResult, vk};
 use ash_window;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{ffi::CStr, sync::Arc};
 
 const API_VERSION: u32 = vk::API_VERSION_1_3;
+type PerFrameInFlight<T> = Vec<T>;
+type PerSwapchainImage<T> = Vec<T>;
 
 #[allow(unused)]
 pub struct Renderer<W>
@@ -30,10 +32,11 @@ where
     graphics_pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    present_complete_semaphore: vk::Semaphore,
-    render_finished_semaphores: Vec<vk::Semaphore>,
-    draw_fence: vk::Fence,
+    command_buffer: PerFrameInFlight<vk::CommandBuffer>,
+    present_complete_semaphore: PerFrameInFlight<vk::Semaphore>,
+    render_finished_semaphores: PerSwapchainImage<vk::Semaphore>,
+    draw_fence: PerFrameInFlight<vk::Fence>,
+    current_frame: usize,
 }
 
 unsafe fn create_instance(
@@ -100,25 +103,24 @@ unsafe fn create_instance(
 
 unsafe fn is_device_suitable(
     instance: &ash::Instance,
-    physical_device: &vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     required_extensions: &[&CStr],
 ) -> bool {
-    let properties = unsafe { instance.get_physical_device_properties(physical_device.clone()) };
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
     let family_properties =
-        unsafe { instance.get_physical_device_queue_family_properties(physical_device.clone()) };
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
     let supports_api_version = properties.api_version >= API_VERSION;
     let supports_graphics = family_properties
         .iter()
         .find(|qf| qf.queue_flags.contains(vk::QueueFlags::GRAPHICS))
         .is_some();
-    let available_extensions = if let Ok(a) =
-        unsafe { instance.enumerate_device_extension_properties(*physical_device) }
-    {
-        a
-    } else {
-        return false;
-    };
+    let available_extensions =
+        if let Ok(a) = unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+            a
+        } else {
+            return false;
+        };
     let support_required_extensions = required_extensions.iter().all(|&req_ext_name| {
         available_extensions
             .iter()
@@ -139,7 +141,7 @@ unsafe fn is_device_suitable(
         .push_next(&mut vulkan_13_features)
         .push_next(&mut vulkan_11_features);
     unsafe {
-        instance.get_physical_device_features2(*physical_device, &mut features2);
+        instance.get_physical_device_features2(physical_device, &mut features2);
     };
     let support_required_features = vulkan_11_features.shader_draw_parameters != 0
         && vulkan_13_features.dynamic_rendering != 0
@@ -181,7 +183,7 @@ unsafe fn pick_physical_device(
     let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
     physical_devices
         .into_iter()
-        .filter(|d| unsafe { is_device_suitable(instance, d, required_extensions) })
+        .filter(|d| unsafe { is_device_suitable(instance, *d, required_extensions) })
         .max_by_key(|pdevice| unsafe { evaluate_physical_device(instance, pdevice) })
         .ok_or(Error::msg("Failed to find a physical device"))
 }
@@ -353,7 +355,7 @@ unsafe fn create_swapchain_image_views(
             create_info.image = *image;
             unsafe { device.create_image_view(&create_info, None) }
         })
-        .collect::<ash::prelude::VkResult<_>>()?)
+        .collect::<VkResult<_>>()?)
 }
 
 fn get_shader_code() -> &'static [u32] {
@@ -542,7 +544,12 @@ impl<W> Renderer<W>
 where
     W: HasDisplayHandle + HasWindowHandle + Send + Sync,
 {
-    pub fn new(window: Arc<W>, window_size: WindowSize, validation_layers: bool) -> Result<Self> {
+    pub fn new(
+        window: Arc<W>,
+        window_size: WindowSize,
+        validation_layers: bool,
+        frames_in_flight: u32,
+    ) -> Result<Self> {
         let entry = unsafe { ash::Entry::load()? };
         let rdh = window.display_handle()?.as_raw();
         let rwh = window.window_handle()?.as_raw();
@@ -601,21 +608,24 @@ where
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info) }?[0];
+            .command_buffer_count(frames_in_flight);
+        let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info) }?;
 
-        let present_complete_semaphore =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        let present_complete_semaphore = (0..frames_in_flight)
+            .map(|_| unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) })
+            .collect::<VkResult<_>>()?;
         let render_finished_semaphores = swapchain_images
             .iter()
             .map(|_| unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) })
-            .collect::<ash::prelude::VkResult<Vec<_>>>()?;
-        let draw_fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        }?;
+            .collect::<VkResult<_>>()?;
+        let draw_fence = (0..frames_in_flight)
+            .map(|_| unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            })
+            .collect::<VkResult<_>>()?;
 
         Ok(Self {
             window,
@@ -640,6 +650,7 @@ where
             present_complete_semaphore,
             render_finished_semaphores,
             draw_fence,
+            current_frame: 0,
         })
     }
 
@@ -647,11 +658,11 @@ where
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe {
             self.device
-                .begin_command_buffer(self.command_buffer, &begin_info)?;
+                .begin_command_buffer(self.command_buffer[self.current_frame], &begin_info)?;
 
             transition_image_layout(
                 &self.device,
-                self.command_buffer,
+                self.command_buffer[self.current_frame],
                 self.swapchain_images[image_index],
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::ATTACHMENT_OPTIMAL,
@@ -699,28 +710,30 @@ where
 
         unsafe {
             self.device
-                .cmd_begin_rendering(self.command_buffer, &rendering_info);
+                .cmd_begin_rendering(self.command_buffer[self.current_frame], &rendering_info);
 
             self.device.cmd_bind_pipeline(
-                self.command_buffer,
+                self.command_buffer[self.current_frame],
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
 
             self.device
-                .cmd_set_viewport(self.command_buffer, 0, &[viewport]);
+                .cmd_set_viewport(self.command_buffer[self.current_frame], 0, &[viewport]);
             self.device
-                .cmd_set_scissor(self.command_buffer, 0, &[scissor]);
+                .cmd_set_scissor(self.command_buffer[self.current_frame], 0, &[scissor]);
 
-            self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+            self.device
+                .cmd_draw(self.command_buffer[self.current_frame], 3, 1, 0, 0);
 
-            self.device.cmd_end_rendering(self.command_buffer);
+            self.device
+                .cmd_end_rendering(self.command_buffer[self.current_frame]);
         }
 
         unsafe {
             transition_image_layout(
                 &self.device,
-                self.command_buffer,
+                self.command_buffer[self.current_frame],
                 self.swapchain_images[image_index],
                 vk::ImageLayout::ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
@@ -730,7 +743,8 @@ where
                 vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
             );
 
-            self.device.end_command_buffer(self.command_buffer)?;
+            self.device
+                .end_command_buffer(self.command_buffer[self.current_frame])?;
         }
 
         Ok(())
@@ -738,14 +752,17 @@ where
 
     pub fn draw_frame(&mut self) -> Result<()> {
         unsafe {
+            self.current_frame = (self.current_frame + 1) % self.command_buffer.len();
+
             self.device
-                .wait_for_fences(&[self.draw_fence], true, u64::MAX)?;
-            self.device.reset_fences(&[self.draw_fence])?;
+                .wait_for_fences(&[self.draw_fence[self.current_frame]], true, u64::MAX)?;
+            self.device
+                .reset_fences(&[self.draw_fence[self.current_frame]])?;
 
             let (image_index, suboptimal) = self.khr_device.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
-                self.present_complete_semaphore,
+                self.present_complete_semaphore[self.current_frame],
                 vk::Fence::null(),
             )?;
 
@@ -756,8 +773,8 @@ where
 
             self.record_command_buffer(image_index as usize)?;
 
-            let pcs = [self.present_complete_semaphore];
-            let cb = [self.command_buffer];
+            let pcs = [self.present_complete_semaphore[self.current_frame]];
+            let cb = [self.command_buffer[self.current_frame]];
             let rfs = [self.render_finished_semaphores[image_index as usize]];
             let wait_dst_storage_mask = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let submit_info = vk::SubmitInfo::default()
@@ -765,8 +782,11 @@ where
                 .command_buffers(&cb)
                 .signal_semaphores(&rfs)
                 .wait_dst_stage_mask(&wait_dst_storage_mask);
-            self.device
-                .queue_submit(self.graphics_queue, &[submit_info], self.draw_fence)?;
+            self.device.queue_submit(
+                self.graphics_queue,
+                &[submit_info],
+                self.draw_fence[self.current_frame],
+            )?;
 
             let swapchain = [self.swapchain];
             let image_indices = [image_index];
@@ -834,15 +854,18 @@ where
         unsafe {
             self.device.device_wait_idle().unwrap();
 
-            self.device.destroy_fence(self.draw_fence, None);
-            self.device
-                .destroy_semaphore(self.present_complete_semaphore, None);
+            for fence in &self.draw_fence {
+                self.device.destroy_fence(*fence, None);
+            }
+            for s in &self.present_complete_semaphore {
+                self.device.destroy_semaphore(*s, None);
+            }
             for s in &self.render_finished_semaphores {
                 self.device.destroy_semaphore(*s, None);
             }
 
             self.device
-                .free_command_buffers(self.command_pool, &[self.command_buffer]);
+                .free_command_buffers(self.command_pool, &self.command_buffer);
             self.device.destroy_command_pool(self.command_pool, None);
 
             self.device.destroy_pipeline(self.graphics_pipeline, None);

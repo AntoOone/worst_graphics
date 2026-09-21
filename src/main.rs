@@ -28,6 +28,7 @@ impl ApplicationHandler for App {
             window.clone(),
             window.inner_size().into(),
             cfg!(debug_assertions),
+            2,
         )
         .unwrap();
         self.rendering_data = Some(RenderingData { window, renderer });
