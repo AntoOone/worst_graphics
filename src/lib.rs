@@ -3,7 +3,7 @@ use anyhow::{Error, Result};
 use ash::{khr, prelude::VkResult, vk};
 use ash_window;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::{ffi::CStr, sync::Arc};
+use std::{ffi::CStr, mem::offset_of, sync::Arc};
 
 const API_VERSION: u32 = vk::API_VERSION_1_3;
 type PerFrameInFlight<T> = Vec<T>;
@@ -37,6 +37,12 @@ where
     render_finished_semaphores: PerSwapchainImage<vk::Semaphore>,
     draw_fence: PerFrameInFlight<vk::Fence>,
     current_frame: usize,
+    vertices: Vec<Vertex>,
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
+    indices: Vec<u16>,
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
 }
 
 unsafe fn create_instance(
@@ -401,7 +407,11 @@ unsafe fn create_graphics_pipeline(
 
     let shader_stages = [vertex_stage_create_info, fragment_stage_create_info];
 
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let binding_description = [Vertex::get_binding_description()];
+    let attributes_descriptions = Vertex::get_attribute_descriptions();
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&binding_description)
+        .vertex_attribute_descriptions(&attributes_descriptions);
 
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -540,6 +550,139 @@ impl From<WindowSize> for vk::Extent2D {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Vertex {
+    pos: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<Self>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }
+    }
+
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: offset_of!(Self, pos) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Self, color) as u32,
+            },
+        ]
+    }
+}
+
+fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    let mem_propreties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    for i in 0..mem_propreties.memory_type_count {
+        let suitable_memory = type_filter & (1 << i) != 0;
+        let suitable_properties = mem_propreties.memory_types[i as usize]
+            .property_flags
+            .contains(properties);
+        if suitable_memory && suitable_properties {
+            return Some(i);
+        }
+    }
+    None
+}
+
+unsafe fn create_index_buffer(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    indices: &[u16],
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let buffer_info = vk::BufferCreateInfo {
+        size: size_of_val(indices) as u64,
+        usage: vk::BufferUsageFlags::INDEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory_allocate_info = vk::MemoryAllocateInfo {
+        allocation_size: mem_requirements.size,
+        memory_type_index: find_memory_type(
+            &instance,
+            physical_device,
+            mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or(Error::msg(
+            "Failed to find a valid memory type for this memory allocation",
+        ))?,
+        ..Default::default()
+    };
+
+    let memory = unsafe { device.allocate_memory(&memory_allocate_info, None) }?;
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+
+    let data =
+        unsafe { device.map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty()) }?;
+    let data = unsafe { ::std::slice::from_raw_parts_mut(data.cast(), indices.len()) };
+    data.copy_from_slice(indices);
+
+    unsafe { device.unmap_memory(memory) };
+    Ok((buffer, memory))
+}
+
+unsafe fn create_vertex_buffer(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    vertices: &[Vertex],
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let buffer_info = vk::BufferCreateInfo {
+        size: size_of_val(vertices) as u64,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory_allocate_info = vk::MemoryAllocateInfo {
+        allocation_size: mem_requirements.size,
+        memory_type_index: find_memory_type(
+            &instance,
+            physical_device,
+            mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or(Error::msg(
+            "Failed to find a valid memory type for this memory allocation",
+        ))?,
+        ..Default::default()
+    };
+
+    let memory = unsafe { device.allocate_memory(&memory_allocate_info, None) }?;
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+
+    let data =
+        unsafe { device.map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty()) }?;
+    let data = unsafe { ::std::slice::from_raw_parts_mut(data.cast(), vertices.len()) };
+    data.copy_from_slice(vertices);
+
+    unsafe { device.unmap_memory(memory) };
+    Ok((buffer, memory))
+}
+
 impl<W> Renderer<W>
 where
     W: HasDisplayHandle + HasWindowHandle + Send + Sync,
@@ -627,6 +770,33 @@ where
             })
             .collect::<VkResult<_>>()?;
 
+        let vertices = vec![
+            Vertex {
+                pos: [-0.5, -0.5].into(),
+                color: [1.0, 0.0, 0.0].into(),
+            },
+            Vertex {
+                pos: [0.5, -0.5].into(),
+                color: [0.0, 1.0, 0.0].into(),
+            },
+            Vertex {
+                pos: [0.5, 0.5].into(),
+                color: [0.0, 0.0, 1.0].into(),
+            },
+            Vertex {
+                pos: [-0.5, 0.5].into(),
+                color: [1.0, 1.0, 1.0].into(),
+            },
+        ];
+
+        let (vertex_buffer, vertex_buffer_memory) =
+            unsafe { create_vertex_buffer(&instance, physical_device, &device, &vertices) }?;
+
+        let indices = vec![0, 1, 2, 2, 3, 0];
+
+        let (triangle_buffer, triangle_buffer_memory) =
+            unsafe { create_index_buffer(&instance, physical_device, &device, &indices) }?;
+
         Ok(Self {
             window,
             entry,
@@ -651,18 +821,25 @@ where
             render_finished_semaphores,
             draw_fence,
             current_frame: 0,
+            vertices,
+            vertex_buffer,
+            vertex_buffer_memory,
+            indices,
+            index_buffer: triangle_buffer,
+            index_buffer_memory: triangle_buffer_memory,
         })
     }
 
     unsafe fn record_command_buffer(&self, image_index: usize) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default();
+        let command_buffer = self.command_buffer[self.current_frame];
         unsafe {
             self.device
-                .begin_command_buffer(self.command_buffer[self.current_frame], &begin_info)?;
+                .begin_command_buffer(command_buffer, &begin_info)?;
 
             transition_image_layout(
                 &self.device,
-                self.command_buffer[self.current_frame],
+                command_buffer,
                 self.swapchain_images[image_index],
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::ATTACHMENT_OPTIMAL,
@@ -710,30 +887,35 @@ where
 
         unsafe {
             self.device
-                .cmd_begin_rendering(self.command_buffer[self.current_frame], &rendering_info);
+                .cmd_begin_rendering(command_buffer, &rendering_info);
 
             self.device.cmd_bind_pipeline(
-                self.command_buffer[self.current_frame],
+                command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
 
             self.device
-                .cmd_set_viewport(self.command_buffer[self.current_frame], 0, &[viewport]);
-            self.device
-                .cmd_set_scissor(self.command_buffer[self.current_frame], 0, &[scissor]);
+                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+            self.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+
+            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
 
             self.device
-                .cmd_draw(self.command_buffer[self.current_frame], 3, 1, 0, 0);
-
-            self.device
-                .cmd_end_rendering(self.command_buffer[self.current_frame]);
+                .cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
+            self.device.cmd_end_rendering(command_buffer);
         }
 
         unsafe {
             transition_image_layout(
                 &self.device,
-                self.command_buffer[self.current_frame],
+                command_buffer,
                 self.swapchain_images[image_index],
                 vk::ImageLayout::ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
@@ -743,8 +925,7 @@ where
                 vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
             );
 
-            self.device
-                .end_command_buffer(self.command_buffer[self.current_frame])?;
+            self.device.end_command_buffer(command_buffer)?;
         }
 
         Ok(())
@@ -752,19 +933,25 @@ where
 
     pub fn draw_frame(&mut self) -> Result<()> {
         unsafe {
-            self.current_frame = (self.current_frame + 1) % self.command_buffer.len();
-
             self.device
                 .wait_for_fences(&[self.draw_fence[self.current_frame]], true, u64::MAX)?;
-            self.device
-                .reset_fences(&[self.draw_fence[self.current_frame]])?;
 
-            let (image_index, suboptimal) = self.khr_device.acquire_next_image(
+            let (image_index, suboptimal) = match self.khr_device.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 self.present_complete_semaphore[self.current_frame],
                 vk::Fence::null(),
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    if err == vk::Result::ERROR_OUT_OF_DATE_KHR {
+                        self.recreate_swapchain(self.swapchain_extent)?;
+                        return Ok(());
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            };
 
             if suboptimal {
                 self.recreate_swapchain(self.swapchain_extent)?;
@@ -772,6 +959,10 @@ where
             }
 
             self.record_command_buffer(image_index as usize)?;
+
+            // We reset the fence only if we are sure that a command will be submitted to the GPU
+            self.device
+                .reset_fences(&[self.draw_fence[self.current_frame]])?;
 
             let pcs = [self.present_complete_semaphore[self.current_frame]];
             let cb = [self.command_buffer[self.current_frame]];
@@ -794,8 +985,16 @@ where
                 .wait_semaphores(&rfs)
                 .swapchains(&swapchain)
                 .image_indices(&image_indices);
-            self.khr_device
+
+            let suboptimal = self
+                .khr_device
                 .queue_present(self.graphics_queue, &present_info_khr)?;
+
+            if suboptimal {
+                self.recreate_swapchain(self.swapchain_extent)?;
+            }
+
+            self.current_frame = (self.current_frame + 1) % self.command_buffer.len();
         }
         Ok(())
     }
@@ -853,6 +1052,12 @@ where
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
+
+            self.device.free_memory(self.index_buffer_memory, None);
+            self.device.destroy_buffer(self.index_buffer, None);
+
+            self.device.free_memory(self.vertex_buffer_memory, None);
+            self.device.destroy_buffer(self.vertex_buffer, None);
 
             for fence in &self.draw_fence {
                 self.device.destroy_fence(*fence, None);
