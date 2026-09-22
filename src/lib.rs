@@ -936,7 +936,7 @@ where
             self.device
                 .wait_for_fences(&[self.draw_fence[self.current_frame]], true, u64::MAX)?;
 
-            let (image_index, suboptimal) = match self.khr_device.acquire_next_image(
+            let (image_index, _) = match self.khr_device.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 self.present_complete_semaphore[self.current_frame],
@@ -953,14 +953,6 @@ where
                 }
             };
 
-            if suboptimal {
-                self.recreate_swapchain(self.swapchain_extent)?;
-                return Ok(());
-            }
-
-            self.record_command_buffer(image_index as usize)?;
-
-            // We reset the fence only if we are sure that a command will be submitted to the GPU
             self.device
                 .reset_fences(&[self.draw_fence[self.current_frame]])?;
 
@@ -968,11 +960,21 @@ where
             let cb = [self.command_buffer[self.current_frame]];
             let rfs = [self.render_finished_semaphores[image_index as usize]];
             let wait_dst_storage_mask = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let submit_info = vk::SubmitInfo::default()
+            let mut submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&pcs)
-                .command_buffers(&cb)
                 .signal_semaphores(&rfs)
                 .wait_dst_stage_mask(&wait_dst_storage_mask);
+
+            let record_command_buffer_result = self.record_command_buffer(image_index as usize);
+            match record_command_buffer_result {
+                Err(err) => {
+                    eprint!("Error when recording the command buffer : {}", err);
+                }
+                Ok(_) => {
+                    submit_info = submit_info.command_buffers(&cb);
+                }
+            }
+
             self.device.queue_submit(
                 self.graphics_queue,
                 &[submit_info],
