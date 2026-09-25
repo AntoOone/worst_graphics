@@ -2,6 +2,7 @@ use anyhow::{Error, Result};
 
 use ash::{khr, prelude::VkResult, vk};
 use ash_window;
+use glam::*;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{ffi::CStr, mem::offset_of, sync::Arc};
 
@@ -22,27 +23,38 @@ where
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
+
     graphics_queue: vk::Queue,
     graphics_queue_index: u32,
+
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_format: vk::SurfaceFormatKHR,
     swapchain_extent: vk::Extent2D,
     swapchain_image_views: Vec<vk::ImageView>,
+
     graphics_pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+
     command_pool: vk::CommandPool,
     command_buffer: PerFrameInFlight<vk::CommandBuffer>,
+
     present_complete_semaphore: PerFrameInFlight<vk::Semaphore>,
     render_finished_semaphores: PerSwapchainImage<vk::Semaphore>,
     draw_fence: PerFrameInFlight<vk::Fence>,
+
     current_frame: usize,
+
     vertices: Vec<Vertex>,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     indices: Vec<u16>,
-    index_buffer: vk::Buffer,
+    index_buffers: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+    uniform_buffers: PerFrameInFlight<UniformBufferFrameData>,
 }
 
 unsafe fn create_instance(
@@ -379,10 +391,55 @@ fn get_shader_code() -> &'static [u32] {
     unsafe { std::slice::from_raw_parts(ALIGNED.0.as_ptr() as *const u32, N / 4) }
 }
 
+unsafe fn create_descriptor_pool(
+    device: &ash::Device,
+    frames_in_flight: u32,
+) -> Result<vk::DescriptorPool> {
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::UNIFORM_BUFFER,
+        descriptor_count: frames_in_flight,
+    }];
+    let pool_create_info = vk::DescriptorPoolCreateInfo::default()
+        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+        .max_sets(frames_in_flight)
+        .pool_sizes(&pool_sizes);
+    Ok(unsafe { device.create_descriptor_pool(&pool_create_info, None) }?)
+}
+
+unsafe fn create_descriptor_sets(
+    device: &ash::Device,
+    uniform_buffers: &[UniformBufferFrameData],
+    descriptor_set_layouts: &[vk::DescriptorSetLayout],
+    descriptor_pool: vk::DescriptorPool,
+) -> Result<Vec<vk::DescriptorSet>> {
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&descriptor_set_layouts);
+    let sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }?;
+
+    for (b, set) in uniform_buffers.iter().zip(&sets) {
+        let buffer_info = [vk::DescriptorBufferInfo {
+            buffer: b.buffer,
+            offset: 0,
+            range: size_of::<UniformBuffer>() as u64,
+        }];
+        let write = [vk::WriteDescriptorSet::default()
+            .buffer_info(&buffer_info)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_count(1)
+            .dst_set(*set)];
+        unsafe { device.update_descriptor_sets(&write, &[]) };
+    }
+
+    Ok(sets)
+}
+
 unsafe fn create_graphics_pipeline(
     device: &ash::Device,
     swapchain_format: vk::SurfaceFormatKHR,
-) -> Result<(vk::Pipeline, vk::PipelineLayout)> {
+) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)> {
     let shader_code = get_shader_code();
     let create_info = vk::ShaderModuleCreateInfo::default().code(shader_code);
 
@@ -445,7 +502,9 @@ unsafe fn create_graphics_pipeline(
         .logic_op(vk::LogicOp::COPY)
         .attachments(&attachements);
 
-    let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&[]);
+    let descriptor_set_layout = [unsafe { create_descriptor_set_layout(device) }?];
+    let pipeline_layout_create_info =
+        vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layout);
     let pipeline_layout =
         unsafe { device.create_pipeline_layout(&pipeline_layout_create_info, None) }?;
 
@@ -471,7 +530,7 @@ unsafe fn create_graphics_pipeline(
     .map_err(|(_, e)| Error::msg(format!("Failed to create pipeline : {}", e)))?[0];
 
     unsafe { device.destroy_shader_module(module, None) };
-    Ok((pipeline, pipeline_layout))
+    Ok((pipeline, pipeline_layout, descriptor_set_layout[0]))
 }
 
 unsafe fn create_command_pool(
@@ -553,8 +612,8 @@ impl From<WindowSize> for vk::Extent2D {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Vertex {
-    pos: [f32; 2],
-    color: [f32; 3],
+    pos: Vec2,
+    color: Vec3,
 }
 
 impl Vertex {
@@ -603,15 +662,17 @@ fn find_memory_type(
     None
 }
 
-unsafe fn create_index_buffer(
+unsafe fn create_buffer(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
-    indices: &[u16],
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    properties: vk::MemoryPropertyFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
     let buffer_info = vk::BufferCreateInfo {
-        size: size_of_val(indices) as u64,
-        usage: vk::BufferUsageFlags::INDEX_BUFFER,
+        size,
+        usage,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
@@ -623,7 +684,7 @@ unsafe fn create_index_buffer(
             &instance,
             physical_device,
             mem_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            properties,
         )
         .ok_or(Error::msg(
             "Failed to find a valid memory type for this memory allocation",
@@ -633,14 +694,107 @@ unsafe fn create_index_buffer(
 
     let memory = unsafe { device.allocate_memory(&memory_allocate_info, None) }?;
     unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+    Ok((buffer, memory))
+}
 
-    let data =
-        unsafe { device.map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty()) }?;
+unsafe fn create_index_buffer(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    indices: &[u16],
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let size = size_of_val(indices) as u64;
+    let (buffer, memory) = unsafe {
+        create_buffer(
+            instance,
+            physical_device,
+            device,
+            size,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }?;
+
+    let data = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }?;
     let data = unsafe { ::std::slice::from_raw_parts_mut(data.cast(), indices.len()) };
     data.copy_from_slice(indices);
 
     unsafe { device.unmap_memory(memory) };
     Ok((buffer, memory))
+}
+
+unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        ..Default::default()
+    }];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    Ok(unsafe { device.create_descriptor_set_layout(&create_info, None) }?)
+}
+
+#[repr(C)]
+struct UniformBuffer {
+    model: Mat4,
+    view: Mat4,
+    proj: Mat4,
+}
+
+#[derive(Clone, Copy)]
+struct UniformBufferFrameData {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    data: *mut UniformBuffer,
+}
+
+unsafe fn create_uniform_buffers(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    frames_in_flight: u32,
+) -> Result<PerFrameInFlight<UniformBufferFrameData>> {
+    Ok((0..frames_in_flight)
+        .map(|_| {
+            let size = size_of::<UniformBuffer>() as u64;
+            let (buffer, memory) = unsafe {
+                create_buffer(
+                    instance,
+                    physical_device,
+                    device,
+                    size,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+            }?;
+            let data =
+                unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }?.cast();
+            Ok(UniformBufferFrameData {
+                buffer,
+                memory,
+                data,
+            })
+        })
+        .collect::<Result<_>>()?)
+}
+
+static START_TIME: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(|| std::time::Instant::now());
+
+unsafe fn update_uniform_buffer(uniform_buffer: UniformBufferFrameData) {
+    let UniformBufferFrameData {
+        buffer: _,
+        memory: _,
+        data,
+    } = uniform_buffer;
+
+    let time = std::time::Instant::now() - *START_TIME;
+    unsafe {
+        (*data).model = Mat4::from_rotation_z(time.as_secs_f32());
+        (*data).view = Mat4::IDENTITY;
+        (*data).proj = Mat4::IDENTITY;
+    }
 }
 
 unsafe fn create_vertex_buffer(
@@ -743,8 +897,19 @@ where
         let swapchain_image_views =
             unsafe { create_swapchain_image_views(swapchain_format, &swapchain_images, &device) }?;
 
-        let (graphics_pipeline, graphics_pipeline_layout) =
+        let (graphics_pipeline, graphics_pipeline_layout, descriptor_set_layout) =
             unsafe { create_graphics_pipeline(&device, swapchain_format) }?;
+
+        // TODO : all the layouts are the same
+        let descriptor_set_layouts: Vec<_> = (0..frames_in_flight)
+            .map(|_| descriptor_set_layout)
+            .collect();
+
+        let descriptor_pool = unsafe { create_descriptor_pool(&device, frames_in_flight) }?;
+
+        let uniform_buffers = unsafe {
+            create_uniform_buffers(&instance, physical_device, &device, frames_in_flight)
+        }?;
 
         let command_pool = unsafe { create_command_pool(&device, graphics_queue_index) }?;
 
@@ -794,8 +959,17 @@ where
 
         let indices = vec![0, 1, 2, 2, 3, 0];
 
-        let (triangle_buffer, triangle_buffer_memory) =
+        let (index_buffers, index_buffer_memory) =
             unsafe { create_index_buffer(&instance, physical_device, &device, &indices) }?;
+
+        let descriptor_sets = unsafe {
+            create_descriptor_sets(
+                &device,
+                &uniform_buffers,
+                &descriptor_set_layouts,
+                descriptor_pool,
+            )
+        }?;
 
         Ok(Self {
             window,
@@ -825,8 +999,12 @@ where
             vertex_buffer,
             vertex_buffer_memory,
             indices,
-            index_buffer: triangle_buffer,
-            index_buffer_memory: triangle_buffer_memory,
+            index_buffers,
+            index_buffer_memory,
+            descriptor_set_layout,
+            uniform_buffers,
+            descriptor_pool,
+            descriptor_sets,
         })
     }
 
@@ -894,12 +1072,21 @@ where
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
+            update_uniform_buffer(self.uniform_buffers[self.current_frame]);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline_layout,
+                0,
+                &[self.descriptor_sets[self.current_frame]],
+                &[],
+            );
 
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
             self.device.cmd_bind_index_buffer(
                 command_buffer,
-                self.index_buffer,
+                self.index_buffers,
                 0,
                 vk::IndexType::UINT16,
             );
@@ -1055,8 +1242,20 @@ where
         unsafe {
             self.device.device_wait_idle().unwrap();
 
+            if let Err(e) = self
+                .device
+                .free_descriptor_sets(self.descriptor_pool, &self.descriptor_sets)
+            {
+                println!("Failed to free descriptor sets : {}", e);
+            }
+
+            for buffer in &self.uniform_buffers {
+                self.device.free_memory(buffer.memory, None);
+                self.device.destroy_buffer(buffer.buffer, None);
+            }
+
             self.device.free_memory(self.index_buffer_memory, None);
-            self.device.destroy_buffer(self.index_buffer, None);
+            self.device.destroy_buffer(self.index_buffers, None);
 
             self.device.free_memory(self.vertex_buffer_memory, None);
             self.device.destroy_buffer(self.vertex_buffer, None);
@@ -1074,10 +1273,15 @@ where
             self.device
                 .free_command_buffers(self.command_pool, &self.command_buffer);
             self.device.destroy_command_pool(self.command_pool, None);
-
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_pipeline(self.graphics_pipeline, None);
+
             self.device
                 .destroy_pipeline_layout(self.graphics_pipeline_layout, None);
+
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             self.cleanup_swapchain();
             self.device.destroy_device(None);
