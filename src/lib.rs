@@ -1,3 +1,5 @@
+mod buffer;
+
 use anyhow::{Error, Result};
 
 use ash::{khr, prelude::VkResult, vk};
@@ -6,7 +8,10 @@ use glam::*;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{ffi::CStr, mem::offset_of, sync::Arc};
 
+use crate::buffer::{MappedBuffer, MappedVec};
+
 const API_VERSION: u32 = vk::API_VERSION_1_3;
+type Index = u16;
 type PerFrameInFlight<T> = Vec<T>;
 type PerSwapchainImage<T> = Vec<T>;
 
@@ -49,12 +54,10 @@ where
     current_frame: usize,
 
     vertices: Vec<Vertex>,
-    vertex_buffer: vk::Buffer,
-    vertex_buffer_memory: vk::DeviceMemory,
+    vertex_buffers: PerFrameInFlight<MappedVec<Vertex>>,
     indices: Vec<u16>,
-    index_buffers: vk::Buffer,
-    index_buffer_memory: vk::DeviceMemory,
-    uniform_buffers: PerFrameInFlight<UniformBufferFrameData>,
+    index_buffers: PerFrameInFlight<MappedVec<Index>>,
+    uniform_buffers: PerFrameInFlight<MappedBuffer<UniformBuffer>>,
 }
 
 unsafe fn create_instance(
@@ -408,7 +411,7 @@ unsafe fn create_descriptor_pool(
 
 unsafe fn create_descriptor_sets(
     device: &ash::Device,
-    uniform_buffers: &[UniformBufferFrameData],
+    uniform_buffers: &[MappedBuffer<UniformBuffer>],
     descriptor_set_layouts: &[vk::DescriptorSetLayout],
     descriptor_pool: vk::DescriptorPool,
 ) -> Result<Vec<vk::DescriptorSet>> {
@@ -419,7 +422,7 @@ unsafe fn create_descriptor_sets(
 
     for (b, set) in uniform_buffers.iter().zip(&sets) {
         let buffer_info = [vk::DescriptorBufferInfo {
-            buffer: b.buffer,
+            buffer: b.get_raw_buffer(),
             offset: 0,
             range: size_of::<UniformBuffer>() as u64,
         }];
@@ -611,7 +614,7 @@ impl From<WindowSize> for vk::Extent2D {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Vertex {
+pub struct Vertex {
     pos: Vec2,
     color: Vec3,
 }
@@ -662,65 +665,27 @@ fn find_memory_type(
     None
 }
 
-unsafe fn create_buffer(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    device: &ash::Device,
-    size: u64,
-    usage: vk::BufferUsageFlags,
-    properties: vk::MemoryPropertyFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let buffer_info = vk::BufferCreateInfo {
-        size,
-        usage,
-        sharing_mode: vk::SharingMode::EXCLUSIVE,
-        ..Default::default()
-    };
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
-    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_allocate_info = vk::MemoryAllocateInfo {
-        allocation_size: mem_requirements.size,
-        memory_type_index: find_memory_type(
-            &instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            properties,
-        )
-        .ok_or(Error::msg(
-            "Failed to find a valid memory type for this memory allocation",
-        ))?,
-        ..Default::default()
-    };
-
-    let memory = unsafe { device.allocate_memory(&memory_allocate_info, None) }?;
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
-    Ok((buffer, memory))
-}
-
 unsafe fn create_index_buffer(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
     indices: &[u16],
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let size = size_of_val(indices) as u64;
-    let (buffer, memory) = unsafe {
-        create_buffer(
-            instance,
-            physical_device,
-            device,
-            size,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-    }?;
-
-    let data = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }?;
-    let data = unsafe { ::std::slice::from_raw_parts_mut(data.cast(), indices.len()) };
-    data.copy_from_slice(indices);
-
-    unsafe { device.unmap_memory(memory) };
-    Ok((buffer, memory))
+    frames_in_flight: u32,
+) -> Result<PerFrameInFlight<MappedVec<Index>>> {
+    Ok((0..frames_in_flight)
+        .map(|_| {
+            Ok(unsafe {
+                MappedVec::new(
+                    instance,
+                    physical_device,
+                    device,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    indices.len(),
+                )
+            }?)
+        })
+        .collect::<Result<_>>()?)
 }
 
 unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
@@ -742,99 +707,57 @@ struct UniformBuffer {
     proj: Mat4,
 }
 
-#[derive(Clone, Copy)]
-struct UniformBufferFrameData {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    data: *mut UniformBuffer,
-}
-
 unsafe fn create_uniform_buffers(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
     frames_in_flight: u32,
-) -> Result<PerFrameInFlight<UniformBufferFrameData>> {
-    Ok((0..frames_in_flight)
-        .map(|_| {
-            let size = size_of::<UniformBuffer>() as u64;
-            let (buffer, memory) = unsafe {
-                create_buffer(
-                    instance,
-                    physical_device,
-                    device,
-                    size,
-                    vk::BufferUsageFlags::UNIFORM_BUFFER,
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
-            }?;
-            let data =
-                unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }?.cast();
-            Ok(UniformBufferFrameData {
-                buffer,
-                memory,
-                data,
-            })
-        })
-        .collect::<Result<_>>()?)
+) -> Result<PerFrameInFlight<MappedBuffer<UniformBuffer>>> {
+    unsafe {
+        MappedBuffer::new_frames_in_flight(
+            instance,
+            physical_device,
+            device,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            frames_in_flight,
+        )
+    }
 }
 
 static START_TIME: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(|| std::time::Instant::now());
 
-unsafe fn update_uniform_buffer(uniform_buffer: UniformBufferFrameData) {
-    let UniformBufferFrameData {
-        buffer: _,
-        memory: _,
-        data,
-    } = uniform_buffer;
+unsafe fn update_uniform_buffer(uniform_buffer: &mut MappedBuffer<UniformBuffer>) {
+    let data = unsafe { uniform_buffer.get_mut() };
 
     let time = std::time::Instant::now() - *START_TIME;
-    unsafe {
-        (*data).model = Mat4::from_rotation_z(time.as_secs_f32());
-        (*data).view = Mat4::IDENTITY;
-        (*data).proj = Mat4::IDENTITY;
-    }
+    (*data).model = Mat4::from_rotation_z(time.as_secs_f32());
+    (*data).view = Mat4::IDENTITY;
+    (*data).proj = Mat4::IDENTITY;
 }
 
-unsafe fn create_vertex_buffer(
+unsafe fn create_vertex_buffers(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
     vertices: &[Vertex],
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
-    let buffer_info = vk::BufferCreateInfo {
-        size: size_of_val(vertices) as u64,
-        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-        sharing_mode: vk::SharingMode::EXCLUSIVE,
-        ..Default::default()
-    };
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
-    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_allocate_info = vk::MemoryAllocateInfo {
-        allocation_size: mem_requirements.size,
-        memory_type_index: find_memory_type(
-            &instance,
-            physical_device,
-            mem_requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or(Error::msg(
-            "Failed to find a valid memory type for this memory allocation",
-        ))?,
-        ..Default::default()
-    };
-
-    let memory = unsafe { device.allocate_memory(&memory_allocate_info, None) }?;
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
-
-    let data =
-        unsafe { device.map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty()) }?;
-    let data = unsafe { ::std::slice::from_raw_parts_mut(data.cast(), vertices.len()) };
-    data.copy_from_slice(vertices);
-
-    unsafe { device.unmap_memory(memory) };
-    Ok((buffer, memory))
+    frames_in_flight: u32,
+) -> Result<PerFrameInFlight<MappedVec<Vertex>>> {
+    Ok((0..frames_in_flight)
+        .map(|_| {
+            Ok(unsafe {
+                MappedVec::new(
+                    instance,
+                    physical_device,
+                    device,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vertices.len(),
+                )
+            }?)
+        })
+        .collect::<Result<_>>()?)
 }
 
 impl<W> Renderer<W>
@@ -954,13 +877,26 @@ where
             },
         ];
 
-        let (vertex_buffer, vertex_buffer_memory) =
-            unsafe { create_vertex_buffer(&instance, physical_device, &device, &vertices) }?;
+        let vertex_buffers = unsafe {
+            create_vertex_buffers(
+                &instance,
+                physical_device,
+                &device,
+                &vertices,
+                frames_in_flight,
+            )
+        }?;
 
         let indices = vec![0, 1, 2, 2, 3, 0];
-
-        let (index_buffers, index_buffer_memory) =
-            unsafe { create_index_buffer(&instance, physical_device, &device, &indices) }?;
+        let index_buffers = unsafe {
+            create_index_buffer(
+                &instance,
+                physical_device,
+                &device,
+                &indices,
+                frames_in_flight,
+            )
+        }?;
 
         let descriptor_sets = unsafe {
             create_descriptor_sets(
@@ -996,19 +932,17 @@ where
             draw_fence,
             current_frame: 0,
             vertices,
-            vertex_buffer,
-            vertex_buffer_memory,
+            vertex_buffers,
             indices,
             index_buffers,
-            index_buffer_memory,
-            descriptor_set_layout,
             uniform_buffers,
+            descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
         })
     }
 
-    unsafe fn record_command_buffer(&self, image_index: usize) -> Result<()> {
+    unsafe fn record_command_buffer(&mut self, image_index: usize) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         let command_buffer = self.command_buffer[self.current_frame];
         unsafe {
@@ -1072,7 +1006,7 @@ where
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
-            update_uniform_buffer(self.uniform_buffers[self.current_frame]);
+            update_uniform_buffer(&mut self.uniform_buffers[self.current_frame]);
             self.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1082,11 +1016,20 @@ where
                 &[],
             );
 
-            self.device
-                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+            let vertex_buffer = &mut self.vertex_buffers[self.current_frame];
+            vertex_buffer.as_mut().copy_from_slice(&self.vertices);
+
+            self.device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                &[vertex_buffer.get_raw_buffer()],
+                &[0],
+            );
+            let index_buffer = &mut self.index_buffers[self.current_frame];
+            index_buffer.as_mut().copy_from_slice(&self.indices);
             self.device.cmd_bind_index_buffer(
                 command_buffer,
-                self.index_buffers,
+                index_buffer.get_raw_buffer(),
                 0,
                 vk::IndexType::UINT16,
             );
@@ -1250,15 +1193,16 @@ where
             }
 
             for buffer in &self.uniform_buffers {
-                self.device.free_memory(buffer.memory, None);
-                self.device.destroy_buffer(buffer.buffer, None);
+                buffer.destroy_ressources(&self.device);
             }
 
-            self.device.free_memory(self.index_buffer_memory, None);
-            self.device.destroy_buffer(self.index_buffers, None);
+            for index_buffer in &self.index_buffers {
+                index_buffer.destroy_ressources(&self.device);
+            }
 
-            self.device.free_memory(self.vertex_buffer_memory, None);
-            self.device.destroy_buffer(self.vertex_buffer, None);
+            for vertex_buffer in &self.vertex_buffers {
+                vertex_buffer.destroy_ressources(&self.device);
+            }
 
             for fence in &self.draw_fence {
                 self.device.destroy_fence(*fence, None);
@@ -1289,4 +1233,11 @@ where
             self.instance.destroy_instance(None);
         }
     }
+}
+
+#[allow(unused)]
+pub struct Mesh {
+    first_vertex: u64,
+    start_index: u16,
+    indices_count: u16,
 }
