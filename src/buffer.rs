@@ -1,7 +1,7 @@
 use anyhow::{Error, Result};
 use ash::{self, vk};
 
-use crate::{PerFrameInFlight, find_memory_type};
+use crate::renderer::{PerFrameInFlight, find_memory_type};
 
 pub struct MappedBuffer<T> {
     buffer: vk::Buffer,
@@ -39,9 +39,9 @@ impl<T> MappedBuffer<T> {
         properties: vk::MemoryPropertyFlags,
         frames_in_flight: u32,
     ) -> Result<PerFrameInFlight<Self>> {
-        Ok((0..frames_in_flight)
+        (0..frames_in_flight)
             .map(|_| unsafe { Self::new(instance, physical_device, device, usage, properties) })
-            .collect::<Result<_>>()?)
+            .collect::<Result<_>>()
     }
 
     pub unsafe fn destroy_ressources(&self, device: &ash::Device) {
@@ -94,6 +94,10 @@ impl<T> MappedVec<T> {
         Ok(Self { buffer, capacity })
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub unsafe fn destroy_ressources(&self, device: &ash::Device) {
         unsafe {
             self.buffer.destroy_ressources(device);
@@ -132,7 +136,7 @@ unsafe fn create_buffer(
     let memory_allocate_info = vk::MemoryAllocateInfo {
         allocation_size: mem_requirements.size,
         memory_type_index: find_memory_type(
-            &instance,
+            instance,
             physical_device,
             mem_requirements.memory_type_bits,
             properties,
