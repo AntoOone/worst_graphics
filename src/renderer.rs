@@ -12,8 +12,9 @@ type Index = u16;
 pub type PerFrameInFlight<T> = Vec<T>;
 type PerSwapchainImage<T> = Vec<T>;
 
-const INDEX_BUFFERS_SIZE: usize = 6;
-const VERTEX_BUFFERS_SIZE: usize = 8;
+const INDEX_BUFFERS_SIZE: usize = 1 << 8;
+const VERTEX_BUFFERS_SIZE: usize = 1 << 8;
+const INSTANCE_BUFFERS_SIZE: usize = 1 << 8;
 
 pub struct Renderer<W>
 where
@@ -54,9 +55,17 @@ where
 
     vertices: Vec<Vertex>,
     vertex_buffers: PerFrameInFlight<MappedVec<Vertex>>,
+
+    instances: Vec<Instance>,
+    instance_buffers: PerFrameInFlight<MappedVec<Instance>>,
+
     indices: Vec<u16>,
     index_buffers: PerFrameInFlight<MappedVec<Index>>,
+
     uniform_buffers: PerFrameInFlight<MappedBuffer<UniformBuffer>>,
+
+    meshes: Vec<Mesh>,
+    camera: Camera,
 }
 
 unsafe fn create_instance(
@@ -463,8 +472,39 @@ unsafe fn create_graphics_pipeline(
 
     let shader_stages = [vertex_stage_create_info, fragment_stage_create_info];
 
-    let binding_description = [Vertex::get_binding_description()];
-    let attributes_descriptions = Vertex::get_attribute_descriptions();
+    let binding_description = [
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<Vertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        },
+        vk::VertexInputBindingDescription {
+            binding: 1,
+            stride: size_of::<Instance>() as u32,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        },
+    ];
+    let attributes_descriptions = [
+        vk::VertexInputAttributeDescription {
+            location: 0,
+            binding: 0,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: offset_of!(Vertex, pos) as u32,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 1,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: offset_of!(Vertex, color) as u32,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 2,
+            binding: 1,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: offset_of!(Instance, pos) as u32,
+        },
+    ];
+
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&binding_description)
         .vertex_attribute_descriptions(&attributes_descriptions);
@@ -481,7 +521,7 @@ unsafe fn create_graphics_pipeline(
         rasterizer_discard_enable: vk::FALSE,
         polygon_mode: vk::PolygonMode::FILL,
         cull_mode: vk::CullModeFlags::BACK,
-        front_face: vk::FrontFace::CLOCKWISE,
+        front_face: vk::FrontFace::COUNTER_CLOCKWISE,
         depth_bias_enable: vk::FALSE,
         line_width: 1f32,
         ..Default::default()
@@ -610,37 +650,16 @@ impl From<WindowSize> for vk::Extent2D {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Vertex {
     pos: Vec2,
     color: Vec3,
 }
 
-impl Vertex {
-    fn get_binding_description() -> vk::VertexInputBindingDescription {
-        vk::VertexInputBindingDescription {
-            binding: 0,
-            stride: size_of::<Self>() as u32,
-            input_rate: vk::VertexInputRate::VERTEX,
-        }
-    }
-
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
-        [
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::Format::R32G32_SFLOAT,
-                offset: offset_of!(Self, pos) as u32,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 1,
-                binding: 0,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: offset_of!(Self, color) as u32,
-            },
-        ]
-    }
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Instance {
+    pos: Vec2,
 }
 
 pub fn find_memory_type(
@@ -719,18 +738,6 @@ unsafe fn create_uniform_buffers(
     }
 }
 
-static START_TIME: std::sync::LazyLock<std::time::Instant> =
-    std::sync::LazyLock::new(std::time::Instant::now);
-
-unsafe fn update_uniform_buffer(uniform_buffer: &mut MappedBuffer<UniformBuffer>) {
-    let data = unsafe { uniform_buffer.get_mut() };
-
-    let time = std::time::Instant::now() - *START_TIME;
-    data.model = Mat4::from_rotation_z(time.as_secs_f32());
-    data.view = Mat4::IDENTITY;
-    data.proj = Mat4::IDENTITY;
-}
-
 unsafe fn create_vertex_buffers(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -746,6 +753,26 @@ unsafe fn create_vertex_buffers(
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 VERTEX_BUFFERS_SIZE,
+            )
+        })
+        .collect::<Result<_>>()
+}
+
+unsafe fn create_instance_buffers(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    frames_in_flight: u32,
+) -> Result<PerFrameInFlight<MappedVec<Instance>>> {
+    (0..frames_in_flight)
+        .map(|_| unsafe {
+            MappedVec::new(
+                instance,
+                physical_device,
+                device,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                INSTANCE_BUFFERS_SIZE,
             )
         })
         .collect::<Result<_>>()
@@ -852,6 +879,10 @@ where
             create_vertex_buffers(&instance, physical_device, &device, frames_in_flight)
         }?;
 
+        let instance_buffers = unsafe {
+            create_instance_buffers(&instance, physical_device, &device, frames_in_flight)
+        }?;
+
         let index_buffers =
             unsafe { create_index_buffer(&instance, physical_device, &device, frames_in_flight) }?;
 
@@ -882,7 +913,10 @@ where
                 color: [1.0, 1.0, 1.0].into(),
             },
         ];
-        let indices = vec![0, 1, 2, 2, 3, 0];
+        let indices = Vec::new();
+        let instances = Vec::new();
+        let meshes = Vec::new();
+        let camera = Camera::default();
 
         Ok(Self {
             _window: window,
@@ -910,12 +944,16 @@ where
             current_frame: 0,
             vertices,
             vertex_buffers,
+            instances,
+            instance_buffers,
             indices,
             index_buffers,
             uniform_buffers,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
+            meshes,
+            camera,
         })
     }
 
@@ -982,7 +1020,15 @@ where
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
-            update_uniform_buffer(&mut self.uniform_buffers[self.current_frame]);
+            // update_uniform_buffer(&mut self.uniform_buffers[self.current_frame]);
+            let data = self.uniform_buffers[self.current_frame].get_mut();
+
+            *data = UniformBuffer {
+                model: self.camera.model,
+                view: self.camera.view,
+                proj: self.camera.proj,
+            };
+
             self.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1003,12 +1049,16 @@ where
                     .copy_from_slice(&self.vertices[0..capacity]);
             }
 
-            self.device.cmd_bind_vertex_buffers(
-                command_buffer,
-                0,
-                &[vertex_buffer.get_raw_buffer()],
-                &[0],
-            );
+            let instance_buffer = &mut self.instance_buffers[self.current_frame];
+            if instance_buffer.capacity() >= self.instances.len() {
+                instance_buffer.as_mut()[0..self.instances.len()].copy_from_slice(&self.instances);
+            } else {
+                eprintln!("The instance limit {} was exceeded", INSTANCE_BUFFERS_SIZE);
+                let capacity = instance_buffer.capacity();
+                instance_buffer
+                    .as_mut()
+                    .copy_from_slice(&self.instances[0..capacity]);
+            }
 
             let index_buffer = &mut self.index_buffers[self.current_frame];
             if index_buffer.capacity() >= self.indices.len() {
@@ -1020,6 +1070,19 @@ where
                     .as_mut()
                     .copy_from_slice(&self.indices[0..capacity]);
             }
+
+            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+
+            self.device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                &[
+                    vertex_buffer.get_raw_buffer(),
+                    instance_buffer.get_raw_buffer(),
+                ],
+                &[0, 0],
+            );
             self.device.cmd_bind_index_buffer(
                 command_buffer,
                 index_buffer.get_raw_buffer(),
@@ -1027,11 +1090,16 @@ where
                 vk::IndexType::UINT16,
             );
 
-            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
-
-            self.device
-                .cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
+            for m in &self.meshes {
+                self.device.cmd_draw_indexed(
+                    command_buffer,
+                    m.index_count,
+                    m.instance_count,
+                    m.first_index,
+                    0,
+                    m.first_instance,
+                );
+            }
             self.device.cmd_end_rendering(command_buffer);
         }
 
@@ -1169,7 +1237,9 @@ where
 
     pub fn begin_drawing<'a>(&'a mut self) -> DrawingTicket<'a, W> {
         self.vertices.clear();
+        self.instances.clear();
         self.indices.clear();
+        self.meshes.clear();
         DrawingTicket(self)
     }
 }
@@ -1195,6 +1265,10 @@ where
 
             for index_buffer in &self.index_buffers {
                 index_buffer.destroy_ressources(&self.device);
+            }
+
+            for instance_buffer in &self.instance_buffers {
+                instance_buffer.destroy_ressources(&self.device);
             }
 
             for vertex_buffer in &self.vertex_buffers {
@@ -1232,11 +1306,13 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 #[allow(unused)]
 pub struct Mesh {
-    first_vertex: u64,
-    start_index: u16,
-    indices_count: u16,
+    first_index: u32,
+    index_count: u32,
+    first_instance: u32,
+    instance_count: u32,
 }
 
 pub struct DrawingTicket<'a, W>(&'a mut Renderer<W>)
@@ -1256,13 +1332,50 @@ where
         self.0.draw_frame()
     }
 
-    pub fn draw_triangle(&mut self, points: [Point; 3]) {
+    pub fn draw_triangle(&mut self, points: &[Point; 3], instances: &[Vec2]) {
+        let first_index = self.0.indices.len() as u32;
+        let index_count = 3;
+        let instance_count = instances.len() as u32;
+        let first_instance = self.0.instances.len() as u32;
         for Point { pos, color } in points {
             self.0.indices.push(self.0.vertices.len() as u16);
             self.0.vertices.push(Vertex {
-                pos: pos.into(),
-                color: color.into(),
+                pos: (*pos).into(),
+                color: (*color).into(),
             });
         }
+        for instance in instances {
+            self.0.instances.push(Instance { pos: *instance });
+        }
+        let mesh = Mesh {
+            first_index,
+            index_count,
+            first_instance,
+            instance_count,
+        };
+        self.0.meshes.push(mesh);
     }
+
+    pub fn draw(&mut self, mesh: &Mesh) {
+        self.0.meshes.push(*mesh);
+    }
+
+    pub fn get_camera(&mut self) -> &mut Camera {
+        &mut self.0.camera
+    }
+
+    pub fn width(&self) -> u32 {
+        self.0.swapchain_extent.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.0.swapchain_extent.height
+    }
+}
+
+#[derive(Default)]
+pub struct Camera {
+    pub model: Mat4,
+    pub view: Mat4,
+    pub proj: Mat4,
 }
