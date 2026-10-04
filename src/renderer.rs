@@ -51,6 +51,7 @@ where
     render_finished_semaphores: PerSwapchainImage<vk::Semaphore>,
     draw_fence: PerFrameInFlight<vk::Fence>,
 
+    frame_count: usize,
     current_frame: usize,
 
     vertices: Vec<Vertex>,
@@ -488,7 +489,7 @@ unsafe fn create_graphics_pipeline(
         vk::VertexInputAttributeDescription {
             location: 0,
             binding: 0,
-            format: vk::Format::R32G32_SFLOAT,
+            format: vk::Format::R32G32B32_SFLOAT,
             offset: offset_of!(Vertex, pos) as u32,
         },
         vk::VertexInputAttributeDescription {
@@ -500,7 +501,7 @@ unsafe fn create_graphics_pipeline(
         vk::VertexInputAttributeDescription {
             location: 2,
             binding: 1,
-            format: vk::Format::R32G32_SFLOAT,
+            format: vk::Format::R32G32B32_SFLOAT,
             offset: offset_of!(Instance, pos) as u32,
         },
     ];
@@ -652,14 +653,14 @@ impl From<WindowSize> for vk::Extent2D {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex {
-    pos: Vec2,
-    color: Vec3,
+    pub pos: Vec3,
+    pub color: Vec3,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Instance {
-    pos: Vec2,
+    pos: Vec3,
 }
 
 pub fn find_memory_type(
@@ -895,24 +896,7 @@ where
             )
         }?;
 
-        let vertices = vec![
-            Vertex {
-                pos: [-0.5, -0.5].into(),
-                color: [1.0, 0.0, 0.0].into(),
-            },
-            Vertex {
-                pos: [0.5, -0.5].into(),
-                color: [0.0, 1.0, 0.0].into(),
-            },
-            Vertex {
-                pos: [0.5, 0.5].into(),
-                color: [0.0, 0.0, 1.0].into(),
-            },
-            Vertex {
-                pos: [-0.5, 0.5].into(),
-                color: [1.0, 1.0, 1.0].into(),
-            },
-        ];
+        let vertices = Vec::new();
         let indices = Vec::new();
         let instances = Vec::new();
         let meshes = Vec::new();
@@ -941,6 +925,7 @@ where
             present_complete_semaphore,
             render_finished_semaphores,
             draw_fence,
+            frame_count: 0,
             current_frame: 0,
             vertices,
             vertex_buffers,
@@ -1020,7 +1005,6 @@ where
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
-            // update_uniform_buffer(&mut self.uniform_buffers[self.current_frame]);
             let data = self.uniform_buffers[self.current_frame].get_mut();
 
             *data = UniformBuffer {
@@ -1329,10 +1313,20 @@ where
     W: HasDisplayHandle + HasWindowHandle + Send + Sync,
 {
     pub fn end_drawing(self) -> Result<()> {
-        self.0.draw_frame()
+        if cfg!(debug_assertions) && self.0.frame_count.is_multiple_of(1000) {
+            println!(
+                "vertices : {}, indices : {}, instances : {}",
+                self.0.vertices.len(),
+                self.0.indices.len(),
+                self.0.instances.len()
+            );
+        }
+        self.0.draw_frame()?;
+        self.0.frame_count += 1;
+        Ok(())
     }
 
-    pub fn draw_triangle(&mut self, points: &[Point; 3], instances: &[Vec2]) {
+    pub fn draw_triangle(&mut self, points: &[Point; 3], instances: &[[f32; 2]]) {
         let first_index = self.0.indices.len() as u32;
         let index_count = 3;
         let instance_count = instances.len() as u32;
@@ -1340,12 +1334,45 @@ where
         for Point { pos, color } in points {
             self.0.indices.push(self.0.vertices.len() as u16);
             self.0.vertices.push(Vertex {
-                pos: (*pos).into(),
-                color: (*color).into(),
+                pos: Vec3::new(pos[0], pos[1], 0.0),
+                color: Vec3::new(color[0], color[1], color[2]),
             });
         }
         for instance in instances {
-            self.0.instances.push(Instance { pos: *instance });
+            self.0.instances.push(Instance {
+                pos: Vec3::new(instance[0], instance[1], 0.0),
+            });
+        }
+        let mesh = Mesh {
+            first_index,
+            index_count,
+            first_instance,
+            instance_count,
+        };
+        self.0.meshes.push(mesh);
+    }
+
+    pub fn draw_mesh(
+        &mut self,
+        vertices: &[crate::Vertex],
+        triangles: &[[Index; 3]],
+        instances: &[[f32; 3]],
+    ) {
+        let first_index = self.0.indices.len() as u32;
+        let index_count = 3 * triangles.len() as u32;
+        let instance_count = instances.len() as u32;
+        let first_instance = self.0.instances.len() as u32;
+
+        for t in triangles {
+            self.0.indices.extend(t);
+        }
+        for v in vertices {
+            self.0.vertices.push((*v).into());
+        }
+        for instance in instances {
+            self.0.instances.push(Instance {
+                pos: (*instance).into(),
+            });
         }
         let mesh = Mesh {
             first_index,

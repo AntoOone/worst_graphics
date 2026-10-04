@@ -22,7 +22,7 @@ fn main() {
                     color: [1.0, 1.0, 1.0],
                 },
             ],
-            &[Vec2::new(-0.5, -0.5), Vec2::new(0.5, 0.5)],
+            &[[-0.5, -0.5], [0.5, 0.5]],
         );
         ticket.draw_triangle(
             &[
@@ -39,7 +39,7 @@ fn main() {
                     color: [1.0, 0.0, 0.0],
                 },
             ],
-            &[Vec2::new(-0.5, -0.5), Vec2::new(0.5, 0.5)],
+            &[[-0.5, -0.5], [0.5, 0.5]],
         );
 
         let time = std::time::Instant::now() - start_time;
