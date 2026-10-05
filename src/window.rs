@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::renderer::{DrawingTicket, Renderer};
 use winit::error::EventLoopError;
@@ -14,12 +15,37 @@ struct RenderingData {
     renderer: Renderer<Window>,
 }
 
-type DrawingFunction = dyn Fn(&mut DrawingTicket<Window>);
+pub trait DrawingFunction: FnMut(&mut LibConfig, &mut DrawingTicket<Window>, f32) {}
 
-#[derive(Default)]
+impl<T: FnMut(&mut LibConfig, &mut DrawingTicket<Window>, f32)> DrawingFunction for T {}
+
+pub struct LibConfig {
+    pub targeted_dt: f32,
+}
+
+impl Default for LibConfig {
+    fn default() -> Self {
+        let targeted_dt = 1.0 / 60.0;
+        Self { targeted_dt }
+    }
+}
+
 struct App {
     rendering_data: Option<RenderingData>,
-    draw_function: Option<Box<DrawingFunction>>,
+    draw_function: Option<Box<dyn DrawingFunction>>,
+    previous_draw: Instant,
+    config: LibConfig,
+}
+
+impl App {
+    fn new(config: LibConfig) -> Self {
+        Self {
+            rendering_data: Default::default(),
+            draw_function: Default::default(),
+            previous_draw: Instant::now(),
+            config,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -45,13 +71,19 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(r) = &mut self.rendering_data {
-                    if let Some(f) = &self.draw_function {
-                        let mut ticket = r.renderer.begin_drawing();
-                        f(&mut ticket);
-                        let _ = ticket.end_drawing();
-                    }
+                if let Some(r) = &mut self.rendering_data
+                    && let Some(f) = &mut self.draw_function
+                {
                     r.window.request_redraw();
+
+                    let now = Instant::now();
+                    let ellapsed = (now - self.previous_draw).as_secs_f32();
+                    if ellapsed >= self.config.targeted_dt {
+                        let mut ticket = r.renderer.begin_drawing();
+                        f(&mut self.config, &mut ticket, ellapsed);
+                        let _ = ticket.end_drawing();
+                        self.previous_draw = now;
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -78,14 +110,14 @@ pub struct Library {
     event_loop: EventLoop<()>,
 }
 
-impl Default for Library {
-    fn default() -> Self {
+impl Library {
+    pub fn new(config: LibConfig) -> Self {
         let event_loop = EventLoop::new().unwrap();
 
-        event_loop.set_control_flow(ControlFlow::Wait);
+        event_loop.set_control_flow(ControlFlow::Poll);
 
         Library {
-            app: App::default(),
+            app: App::new(config),
             event_loop,
         }
     }
@@ -94,7 +126,7 @@ impl Default for Library {
 impl Library {
     pub fn draw_function<F>(&mut self, func: F)
     where
-        F: 'static + Fn(&mut DrawingTicket<Window>),
+        F: 'static + DrawingFunction,
     {
         self.app.draw_function = Some(Box::new(func));
     }

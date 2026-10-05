@@ -498,11 +498,30 @@ unsafe fn create_graphics_pipeline(
             format: vk::Format::R32G32B32_SFLOAT,
             offset: offset_of!(Vertex, color) as u32,
         },
+        // To pass instance.local_to_world to the shader, we see it as 4 * Vec4
         vk::VertexInputAttributeDescription {
             location: 2,
             binding: 1,
-            format: vk::Format::R32G32B32_SFLOAT,
-            offset: offset_of!(Instance, pos) as u32,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Instance, local_to_world) as u32,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 3,
+            binding: 1,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Instance, local_to_world) as u32 + 16,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 4,
+            binding: 1,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Instance, local_to_world) as u32 + 2 * 16,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 5,
+            binding: 1,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Instance, local_to_world) as u32 + 3 * 16,
         },
     ];
 
@@ -660,7 +679,7 @@ pub struct Vertex {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Instance {
-    pos: Vec3,
+    local_to_world: Mat4,
 }
 
 pub fn find_memory_type(
@@ -716,9 +735,7 @@ unsafe fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::Descr
 
 #[repr(C)]
 struct UniformBuffer {
-    model: Mat4,
-    view: Mat4,
-    proj: Mat4,
+    world_to_screen: Mat4,
 }
 
 unsafe fn create_uniform_buffers(
@@ -1008,9 +1025,7 @@ where
             let data = self.uniform_buffers[self.current_frame].get_mut();
 
             *data = UniformBuffer {
-                model: self.camera.model,
-                view: self.camera.view,
-                proj: self.camera.proj,
+                world_to_screen: self.camera.proj * self.camera.view * self.camera.model,
             };
 
             self.device.cmd_bind_descriptor_sets(
@@ -1340,7 +1355,7 @@ where
         }
         for instance in instances {
             self.0.instances.push(Instance {
-                pos: Vec3::new(instance[0], instance[1], 0.0),
+                local_to_world: Mat4::from_translation(Vec3::new(instance[0], instance[1], 0.0)),
             });
         }
         let mesh = Mesh {
@@ -1371,7 +1386,7 @@ where
         }
         for instance in instances {
             self.0.instances.push(Instance {
-                pos: (*instance).into(),
+                local_to_world: Mat4::from_translation((*instance).into()),
             });
         }
         let mesh = Mesh {

@@ -1,12 +1,12 @@
 use ::core::f32;
 
 use glam::{camera::rh::proj::vulkan::*, *};
-use worse_graphics::{Library, Point};
+use worse_graphics::{LibConfig, Library, Point};
 
 fn main() {
-    let mut library = Library::default();
+    let mut library = Library::new(LibConfig::default());
     let start_time = std::time::Instant::now();
-    library.draw_function(move |ticket| {
+    library.draw_function(move |_config, ticket, _dt| {
         ticket.draw_triangle(
             &[
                 Point {

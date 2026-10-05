@@ -3,7 +3,7 @@ mod renderer;
 mod window;
 
 pub use renderer::{DrawingTicket, Point};
-pub use window::Library;
+pub use window::{LibConfig, Library};
 
 #[derive(Clone, Copy)]
 pub struct Vertex {

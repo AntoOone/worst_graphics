@@ -1,7 +1,7 @@
 use ::core::f32;
 
 use glam::{camera::rh::proj::vulkan::*, *};
-use worse_graphics::{Library, Vertex};
+use worse_graphics::{LibConfig, Library, Vertex};
 
 fn main() {
     let colr = [0.9, 0.3, 0.3];
@@ -58,11 +58,13 @@ fn main() {
     ];
     let instances = [[0.0, 0.0, 0.0]];
 
-    let mut library = Library::default();
+    let mut library = Library::new(LibConfig::default());
     let start_time = std::time::Instant::now();
-    library.draw_function(move |ticket| {
+    library.draw_function(move |_config, ticket, dt| {
         ticket.draw_mesh(&vertices, &triangles, &instances);
-        let time = std::time::Instant::now() - start_time;
+        let now = std::time::Instant::now();
+        let time = now - start_time;
+        println!("FPS : {}", 1.0 / dt);
         let a = ticket.width() as f32 / ticket.height() as f32;
         let pos = Vec3::new(0.0, 0.0, 3.0);
         let camera = ticket.get_camera();
