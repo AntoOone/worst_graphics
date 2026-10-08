@@ -33,6 +33,7 @@ impl Swapchain {
         khr_instance: &khr::surface::Instance,
         khr_device: &khr::swapchain::Device,
         recomended_extent: vk::Extent2D,
+        old_swapchain: Option<vk::SwapchainKHR>,
     ) -> Result<Swapchain> {
         let available_formats =
             unsafe { khr_instance.get_physical_device_surface_formats(physical_device, surface) }?;
@@ -76,6 +77,7 @@ impl Swapchain {
                 surface_capabilities_khr.max_image_extent.height,
             ),
         };
+        #[cfg(debug_assertions)]
         println!("Swapchain extent : {:?}", extent);
 
         let mut min_image_count = 3.max(surface_capabilities_khr.min_image_count);
@@ -83,6 +85,7 @@ impl Swapchain {
             min_image_count = min_image_count.min(surface_capabilities_khr.max_image_count);
         }
 
+        let old_swapchain = old_swapchain.unwrap_or(vk::SwapchainKHR::null());
         let create_info = vk::SwapchainCreateInfoKHR {
             surface,
             min_image_count,
@@ -96,6 +99,7 @@ impl Swapchain {
             composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             present_mode,
             clipped: vk::TRUE,
+            old_swapchain,
             ..Default::default()
         };
 
@@ -879,6 +883,7 @@ where
                 &khr_instance,
                 &khr_device,
                 window_size.into(),
+                None,
             )
         }?;
 
@@ -1239,19 +1244,21 @@ where
     unsafe fn recreate_swapchain(&mut self, new_extent: vk::Extent2D) -> Result<()> {
         #[cfg(debug_assertions)]
         println!("\nSwapchain recreation");
-        unsafe {
-            self.device.device_wait_idle()?;
-            self.swapchain.cleanup(&self.device, &self.khr_device);
-            self.swapchain = Swapchain::new(
+
+        unsafe { self.device.device_wait_idle() }?;
+        let new_swapchain = unsafe {
+            Swapchain::new(
                 &self.device,
                 self.physical_device,
                 self.surface,
                 &self.khr_instance,
                 &self.khr_device,
                 new_extent,
-            )?;
-        }
-
+                Some(self.swapchain.swapchain),
+            )
+        }?;
+        let old_swapchain = std::mem::replace(&mut self.swapchain, new_swapchain);
+        unsafe { old_swapchain.cleanup(&self.device, &self.khr_device) };
         Ok(())
     }
 
