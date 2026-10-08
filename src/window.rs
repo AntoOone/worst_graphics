@@ -1,14 +1,13 @@
-use std::sync::Arc;
-use std::time::Instant;
-
 use crate::renderer::{DrawingTicket, Renderer};
-use winit::error::EventLoopError;
-use winit::keyboard::Key;
 
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use std::{sync::Arc, time::Instant};
+use winit::{
+    application::ApplicationHandler,
+    error::EventLoopError,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::{Window, WindowId},
+};
 
 struct RenderingData {
     window: Arc<Window>,
@@ -67,7 +66,6 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match &event {
             WindowEvent::CloseRequested => {
-                println!("The close button was pressed; stopping");
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -86,18 +84,9 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput {
-                device_id: _,
-                event,
-                is_synthetic: _,
-            } if let Key::Character(c) = &event.logical_key
-                && event.state == ElementState::Pressed =>
-            {
-                println!("character pressed : {}", c);
-            }
             WindowEvent::Resized(new_size) => {
                 if let Some(r) = &mut self.rendering_data {
-                    r.renderer.window_resized(new_size.into()).unwrap();
+                    r.renderer.window_resized(new_size.into());
                 }
             }
             _ => (),
